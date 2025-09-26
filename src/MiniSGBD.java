@@ -1,4 +1,4 @@
-import java.io.IOException;
+﻿import java.io.IOException; 
 import java.io.RandomAccessFile;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -7,6 +7,7 @@ import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 
@@ -20,6 +21,7 @@ public class MiniSGBD {
         final byte[] data;
         int pinCount;
         boolean dirty;
+        boolean transactional;
 
         PageFrame(byte[] data) {
             this.data = data;
@@ -29,6 +31,8 @@ public class MiniSGBD {
     private final Path filePath;
     private final Map<Integer, PageFrame> bufferPool = new HashMap<>();
     private long recordCount;
+    private boolean inTransaction;
+    private long transactionStartRecordCount = -1;
 
     public MiniSGBD(String fileName) throws IOException {
         this.filePath = Paths.get(fileName);
@@ -40,6 +44,56 @@ public class MiniSGBD {
             throw new IOException("Corrupted data file: size not aligned with record size");
         }
         this.recordCount = size / RECORD_SIZE;
+    }
+
+    public synchronized void begin() {
+        if (inTransaction) {
+            try {
+                commit();
+            } catch (IOException e) {
+                throw new RuntimeException("Failed to commit active transaction before starting a new one", e);
+            }
+        }
+        inTransaction = true;
+        transactionStartRecordCount = recordCount;
+    }
+
+    public synchronized void commit() throws IOException {
+        if (!inTransaction) {
+            return;
+        }
+        for (Map.Entry<Integer, PageFrame> entry : bufferPool.entrySet()) {
+            int pageId = entry.getKey();
+            PageFrame frame = entry.getValue();
+            if (frame.dirty && frame.transactional) {
+                writePageToDisk(pageId, frame);
+                frame.dirty = false;
+                frame.transactional = false;
+            }
+        }
+        inTransaction = false;
+        transactionStartRecordCount = -1;
+    }
+
+    public synchronized void rollback() {
+        if (!inTransaction) {
+            return;
+        }
+        recordCount = transactionStartRecordCount;
+        transactionStartRecordCount = -1;
+
+        Iterator<Map.Entry<Integer, PageFrame>> iterator = bufferPool.entrySet().iterator();
+        while (iterator.hasNext()) {
+            Map.Entry<Integer, PageFrame> entry = iterator.next();
+            PageFrame frame = entry.getValue();
+            if (frame.transactional) {
+                if (frame.pinCount != 0) {
+                    throw new IllegalStateException("Cannot rollback while page " + entry.getKey() + " is still pinned");
+                }
+                iterator.remove();
+            }
+        }
+        inTransaction = false;
     }
 
     public synchronized byte[] fix(int pageId) throws IOException {
@@ -69,6 +123,9 @@ public class MiniSGBD {
             throw new IllegalStateException("Page " + pageId + " is not in buffer");
         }
         frame.dirty = true;
+        if (inTransaction) {
+            frame.transactional = true;
+        }
     }
 
     public synchronized void force(int pageId) throws IOException {
@@ -76,19 +133,30 @@ public class MiniSGBD {
         if (frame == null || !frame.dirty) {
             return;
         }
-        long startRecord = (long) pageId * RECORDS_PER_PAGE;
-        if (startRecord >= recordCount) {
-            frame.dirty = false;
+        if (frame.transactional && inTransaction) {
             return;
         }
-        int recordsOnPage = (int) Math.min(RECORDS_PER_PAGE, recordCount - startRecord);
+        writePageToDisk(pageId, frame);
+        frame.dirty = false;
+        frame.transactional = false;
+    }
+
+    private void writePageToDisk(int pageId, PageFrame frame) throws IOException {
+        long startRecord = (long) pageId * RECORDS_PER_PAGE;
+        if (startRecord >= recordCount) {
+            return;
+        }
+        long remainingRecords = recordCount - startRecord;
+        int recordsOnPage = (int) Math.min(RECORDS_PER_PAGE, remainingRecords);
+        if (recordsOnPage <= 0) {
+            return;
+        }
         int bytesToWrite = recordsOnPage * RECORD_SIZE;
         long offset = startRecord * RECORD_SIZE;
         try (RandomAccessFile raf = new RandomAccessFile(filePath.toFile(), "rw")) {
             raf.seek(offset);
             raf.write(frame.data, 0, bytesToWrite);
         }
-        frame.dirty = false;
     }
 
     private byte[] loadPageData(int pageId) throws IOException {
@@ -227,5 +295,23 @@ public class MiniSGBD {
         System.out.println("Page 1 : " + db.getPage(0));
         System.out.println("Page 2 : " + db.getPage(1));
         System.out.println("Page 3 : " + db.getPage(2));
+
+        // 🔹 Démonstration rollback
+        db.begin();
+        db.insertRecord("Etudiant 200");
+        db.insertRecord("Etudiant 201");
+        db.rollback();
+        System.out.println("Count après rollback (attendu 105) : " + db.getRecordCount());
+
+        // 🔹 Démonstration commit
+        db.begin();
+        db.insertRecord("Etudiant 202");
+        db.insertRecord("Etudiant 203");
+        db.commit();
+        System.out.println("Count après commit (attendu 107) : " + db.getRecordCount());
+
+        // Vérification que les enregistrements sont bien présents
+        System.out.println("Enregistrement 106 : " + db.readRecord(105));
+        System.out.println("Enregistrement 107 : " + db.readRecord(106));
     }
 }
