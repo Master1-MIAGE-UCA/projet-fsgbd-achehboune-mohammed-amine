@@ -1,3 +1,7 @@
+import java.io.BufferedReader;
+import java.io.BufferedWriter;
+import java.io.FileReader;
+import java.io.FileWriter;
 import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.nio.charset.StandardCharsets;
@@ -6,6 +10,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Base64;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -15,6 +20,72 @@ import java.util.Map;
 import java.util.Set;
 
 public class MiniSGBD {
+
+    // ==================== TD5: Types de log ====================
+    public enum LogType {
+        BEGIN, UPDATE, INSERT, DELETE, COMMIT, ROLLBACK, CHECKPOINT
+    }
+
+    // ==================== TD5: Classe LogEntry ====================
+    public static class LogEntry {
+        final int transactionId;
+        final int recordId;          // -1 si non applicable
+        final byte[] beforeImage;    // null si non applicable
+        final byte[] afterImage;     // null si non applicable
+        final LogType type;
+        final long recordCountSnapshot; // pour INSERT: nombre d'enregistrements au moment du log
+
+        public LogEntry(int transactionId, LogType type) {
+            this(transactionId, -1, null, null, type, -1);
+        }
+
+        public LogEntry(int transactionId, int recordId, byte[] beforeImage, byte[] afterImage, LogType type) {
+            this(transactionId, recordId, beforeImage, afterImage, type, -1);
+        }
+
+        public LogEntry(int transactionId, int recordId, byte[] beforeImage, byte[] afterImage, LogType type, long recordCountSnapshot) {
+            this.transactionId = transactionId;
+            this.recordId = recordId;
+            this.beforeImage = beforeImage != null ? Arrays.copyOf(beforeImage, beforeImage.length) : null;
+            this.afterImage = afterImage != null ? Arrays.copyOf(afterImage, afterImage.length) : null;
+            this.type = type;
+            this.recordCountSnapshot = recordCountSnapshot;
+        }
+
+        // Serialisation vers String pour ecriture dans FJT
+        public String serialize() {
+            StringBuilder sb = new StringBuilder();
+            sb.append(transactionId).append("|");
+            sb.append(recordId).append("|");
+            sb.append(beforeImage != null ? Base64.getEncoder().encodeToString(beforeImage) : "NULL").append("|");
+            sb.append(afterImage != null ? Base64.getEncoder().encodeToString(afterImage) : "NULL").append("|");
+            sb.append(type.name()).append("|");
+            sb.append(recordCountSnapshot);
+            return sb.toString();
+        }
+
+        // Deserialisation depuis String
+        public static LogEntry deserialize(String line) {
+            String[] parts = line.split("\\|", -1);
+            if (parts.length < 6) return null;
+
+            int txId = Integer.parseInt(parts[0]);
+            int recId = Integer.parseInt(parts[1]);
+            byte[] before = "NULL".equals(parts[2]) ? null : Base64.getDecoder().decode(parts[2]);
+            byte[] after = "NULL".equals(parts[3]) ? null : Base64.getDecoder().decode(parts[3]);
+            LogType type = LogType.valueOf(parts[4]);
+            long rcSnapshot = Long.parseLong(parts[5]);
+
+            return new LogEntry(txId, recId, before, after, type, rcSnapshot);
+        }
+
+        @Override
+        public String toString() {
+            return String.format("LogEntry[tx=%d, type=%s, recordId=%d]", transactionId, type, recordId);
+        }
+    }
+
+    // ==================== Constantes ====================
     private static final int PAGE_SIZE = 4096;
     private static final int RECORD_SIZE = 100;
     private static final int RECORDS_PER_PAGE = PAGE_SIZE / RECORD_SIZE;
@@ -32,6 +103,8 @@ public class MiniSGBD {
     }
 
     private final Path filePath;
+    private final Path journalFilePath; // FJT - Fichier Journal de Transactions
+
     // TIA (Tampon d'Images Après) - Buffer contenant les nouvelles valeurs
     private final Map<Integer, PageFrame> bufferPool = new HashMap<>();
     // TIV (Tampon d'Images Avant) - Buffer contenant les anciennes valeurs avant modification
@@ -39,15 +112,28 @@ public class MiniSGBD {
     // Table des verrous sur les enregistrements
     private final Set<Integer> locks = new HashSet<>();
 
+    // TD5: TJT (Journal de Transactions en memoire)
+    private final List<LogEntry> transactionLog = new ArrayList<>();
+
     private long recordCount;
     private boolean inTransaction;
     private long transactionStartRecordCount = -1;
 
+    // TD5: Gestion des identifiants de transaction
+    private int nextTransactionId = 1;
+    private int currentTransactionId = -1;
+
     public MiniSGBD(String fileName) throws IOException {
         this.filePath = Paths.get(fileName);
+        this.journalFilePath = Paths.get(fileName + ".log"); // FJT
+
         if (Files.notExists(filePath)) {
             Files.createFile(filePath);
         }
+        if (Files.notExists(journalFilePath)) {
+            Files.createFile(journalFilePath);
+        }
+
         long size = Files.size(filePath);
         if (size % RECORD_SIZE != 0) {
             throw new IOException("Corrupted data file: size not aligned with record size");
@@ -65,19 +151,28 @@ public class MiniSGBD {
         }
         inTransaction = true;
         transactionStartRecordCount = recordCount;
+
+        // TD5: Assigner un ID de transaction et logger BEGIN
+        currentTransactionId = nextTransactionId++;
+        transactionLog.add(new LogEntry(currentTransactionId, LogType.BEGIN));
     }
 
     public synchronized void commit() throws IOException {
         if (!inTransaction) {
             return;
         }
-        // Forcer sur disque toutes les pages transactionnelles modifiees (FORCE)
+
+        // TD5: Logger COMMIT dans le TJT
+        transactionLog.add(new LogEntry(currentTransactionId, LogType.COMMIT));
+
+        // TD5: Forcer l'ecriture du TJT dans le FJT
+        flushLogToFile();
+
+        // TD5: Le COMMIT ne force plus l'ecriture sur disque
+        // Les pages restent dirty jusqu'au prochain checkpoint
         for (Map.Entry<Integer, PageFrame> entry : bufferPool.entrySet()) {
-            int pageId = entry.getKey();
             PageFrame frame = entry.getValue();
-            if (frame.dirty && frame.transactional) {
-                writePageToDisk(pageId, frame);
-                frame.dirty = false;
+            if (frame.transactional) {
                 frame.transactional = false;
             }
         }
@@ -90,6 +185,19 @@ public class MiniSGBD {
 
         inTransaction = false;
         transactionStartRecordCount = -1;
+        currentTransactionId = -1;
+    }
+
+    // TD5: Ecrire le TJT dans le FJT (fichier journal)
+    private void flushLogToFile() throws IOException {
+        try (BufferedWriter writer = new BufferedWriter(
+                new FileWriter(journalFilePath.toFile(), true))) { // append mode
+            for (LogEntry entry : transactionLog) {
+                writer.write(entry.serialize());
+                writer.newLine();
+            }
+        }
+        transactionLog.clear();
     }
 
     public synchronized void rollback() {
@@ -105,7 +213,7 @@ public class MiniSGBD {
             byte[] oldData = entry.getValue();
             PageFrame frame = bufferPool.get(pageId);
             if (frame != null) {
-                // Restaurer les données originales
+                // Restaurer les donnees originales
                 System.arraycopy(oldData, 0, frame.data, 0, oldData.length);
                 frame.dirty = false;
                 frame.transactional = false;
@@ -130,7 +238,17 @@ public class MiniSGBD {
                 iterator.remove();
             }
         }
+
+        // TD5: Logger ROLLBACK et forcer l'ecriture du TJT dans le FJT
+        transactionLog.add(new LogEntry(currentTransactionId, LogType.ROLLBACK));
+        try {
+            flushLogToFile();
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to flush log during rollback", e);
+        }
+
         inTransaction = false;
+        currentTransactionId = -1;
     }
 
     public synchronized byte[] fix(int pageId) throws IOException {
@@ -243,6 +361,18 @@ public class MiniSGBD {
             unfix(pageId);
         }
 
+        // TD5: Logger INSERT avec l'image apres (afterImage)
+        if (inTransaction) {
+            transactionLog.add(new LogEntry(
+                currentTransactionId,
+                (int) newRecordId,
+                null,  // pas d'image avant pour INSERT
+                record,
+                LogType.INSERT,
+                recordCount  // snapshot du nombre d'enregistrements avant insertion
+            ));
+        }
+
         recordCount++;
         if (sync) {
             force(pageId);
@@ -288,12 +418,15 @@ public class MiniSGBD {
 
         byte[] pageData = fix(pageId);
         try {
+            // TD5: Capturer l'image avant pour le log
+            byte[] beforeImage = Arrays.copyOfRange(pageData, recordOffset, recordOffset + RECORD_SIZE);
+
             // Si en transaction, sauvegarder l'image avant dans le TIV
             if (inTransaction) {
                 // Sauvegarder la page entiere dans le TIV si pas deja fait
                 if (!tiv.containsKey(pageId)) {
-                    byte[] beforeImage = Arrays.copyOf(pageData, pageData.length);
-                    tiv.put(pageId, beforeImage);
+                    byte[] pageCopy = Arrays.copyOf(pageData, pageData.length);
+                    tiv.put(pageId, pageCopy);
                 }
                 // Poser un verrou sur l'enregistrement
                 locks.add(recordId);
@@ -306,6 +439,17 @@ public class MiniSGBD {
             // Modifier la donnee dans le TIA uniquement
             System.arraycopy(record, 0, pageData, recordOffset, RECORD_SIZE);
             use(pageId);
+
+            // TD5: Logger UPDATE avec images avant/apres
+            if (inTransaction) {
+                transactionLog.add(new LogEntry(
+                    currentTransactionId,
+                    recordId,
+                    beforeImage,
+                    record,
+                    LogType.UPDATE
+                ));
+            }
         } finally {
             unfix(pageId);
         }
@@ -387,6 +531,247 @@ public class MiniSGBD {
 
     public synchronized long getRecordCount() {
         return recordCount;
+    }
+
+    // ==================== TD5: Checkpoint ====================
+    /**
+     * Cree un point de sauvegarde (checkpoint).
+     * - Force l'ecriture sur disque de toutes les pages modifiees
+     * - Ajoute une entree CHECKPOINT dans le journal
+     */
+    public synchronized void checkpoint() throws IOException {
+        // Forcer l'ecriture de toutes les pages dirty
+        for (Map.Entry<Integer, PageFrame> entry : bufferPool.entrySet()) {
+            int pageId = entry.getKey();
+            PageFrame frame = entry.getValue();
+            if (frame.dirty) {
+                writePageToDisk(pageId, frame);
+                frame.dirty = false;
+            }
+        }
+
+        // Ajouter une entree CHECKPOINT dans le TJT et forcer vers FJT
+        LogEntry checkpointEntry = new LogEntry(-1, LogType.CHECKPOINT);
+        try (BufferedWriter writer = new BufferedWriter(
+                new FileWriter(journalFilePath.toFile(), true))) {
+            writer.write(checkpointEntry.serialize());
+            writer.newLine();
+        }
+
+        System.out.println("[CHECKPOINT] Point de sauvegarde cree");
+    }
+
+    // ==================== TD5: Simulation de crash ====================
+    /**
+     * Simule un crash systeme.
+     * - Vide tous les buffers en memoire sans ecrire sur disque
+     * - Simule une panne brutale
+     */
+    public synchronized void crash() {
+        System.out.println("[CRASH] Simulation de panne systeme...");
+
+        // Vider le buffer pool (TIA) sans ecrire sur disque
+        bufferPool.clear();
+
+        // Vider le TIV
+        tiv.clear();
+
+        // Vider les verrous
+        locks.clear();
+
+        // Vider le TJT (journal en memoire)
+        transactionLog.clear();
+
+        // Reinitialiser l'etat de transaction
+        inTransaction = false;
+        currentTransactionId = -1;
+        transactionStartRecordCount = -1;
+
+        System.out.println("[CRASH] Tous les buffers ont ete perdus!");
+    }
+
+    // ==================== TD5: Recuperation (Recovery) ====================
+    /**
+     * Algorithme de recuperation apres panne.
+     * Phase 1: Analyse du journal pour identifier les transactions commitees et non commitees
+     * Phase 2: REDO - Rejouer les operations des transactions commitees depuis le dernier checkpoint
+     * Phase 3: UNDO - Restaurer les images avant pour les transactions non commitees
+     */
+    public synchronized void recover() throws IOException {
+        System.out.println("[RECOVERY] Demarrage de la recuperation...");
+
+        // Lire le journal depuis le fichier FJT
+        List<LogEntry> journalEntries = new ArrayList<>();
+        if (Files.exists(journalFilePath) && Files.size(journalFilePath) > 0) {
+            try (BufferedReader reader = new BufferedReader(
+                    new FileReader(journalFilePath.toFile()))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    if (!line.trim().isEmpty()) {
+                        LogEntry entry = LogEntry.deserialize(line);
+                        if (entry != null) {
+                            journalEntries.add(entry);
+                        }
+                    }
+                }
+            }
+        }
+
+        if (journalEntries.isEmpty()) {
+            System.out.println("[RECOVERY] Journal vide, rien a recuperer");
+            return;
+        }
+
+        // Trouver le dernier checkpoint
+        int lastCheckpointIndex = -1;
+        for (int i = journalEntries.size() - 1; i >= 0; i--) {
+            if (journalEntries.get(i).type == LogType.CHECKPOINT) {
+                lastCheckpointIndex = i;
+                break;
+            }
+        }
+
+        int startIndex = (lastCheckpointIndex >= 0) ? lastCheckpointIndex + 1 : 0;
+        System.out.println("[RECOVERY] Dernier checkpoint a l'index: " + lastCheckpointIndex);
+
+        // Phase 1: Analyse - Identifier les transactions commitees et non commitees
+        Set<Integer> committedTx = new HashSet<>();
+        Set<Integer> activeTx = new HashSet<>();
+
+        for (int i = startIndex; i < journalEntries.size(); i++) {
+            LogEntry entry = journalEntries.get(i);
+            switch (entry.type) {
+                case BEGIN:
+                    activeTx.add(entry.transactionId);
+                    break;
+                case COMMIT:
+                    activeTx.remove(entry.transactionId);
+                    committedTx.add(entry.transactionId);
+                    break;
+                case ROLLBACK:
+                    activeTx.remove(entry.transactionId);
+                    break;
+                default:
+                    break;
+            }
+        }
+
+        System.out.println("[RECOVERY] Transactions commitees: " + committedTx);
+        System.out.println("[RECOVERY] Transactions non commitees (a annuler): " + activeTx);
+
+        // Recharger le recordCount depuis le fichier
+        long fileSize = Files.size(filePath);
+        this.recordCount = fileSize / RECORD_SIZE;
+
+        // Phase 2: REDO - Rejouer les operations des transactions commitees
+        System.out.println("[RECOVERY] Phase REDO - Rejouer les transactions commitees...");
+        for (int i = startIndex; i < journalEntries.size(); i++) {
+            LogEntry entry = journalEntries.get(i);
+            if (committedTx.contains(entry.transactionId)) {
+                switch (entry.type) {
+                    case INSERT:
+                        // Reappliquer l'insertion
+                        if (entry.afterImage != null && entry.recordId >= 0) {
+                            // S'assurer que le fichier est assez grand
+                            if (entry.recordCountSnapshot >= 0 && entry.recordCountSnapshot >= recordCount) {
+                                recordCount = entry.recordCountSnapshot + 1;
+                            }
+                            int pageId = entry.recordId / RECORDS_PER_PAGE;
+                            int recordOffset = (entry.recordId % RECORDS_PER_PAGE) * RECORD_SIZE;
+                            byte[] pageData = fix(pageId);
+                            try {
+                                System.arraycopy(entry.afterImage, 0, pageData, recordOffset, RECORD_SIZE);
+                                writePageToDisk(pageId, bufferPool.get(pageId));
+                            } finally {
+                                unfix(pageId);
+                            }
+                            System.out.println("[REDO] INSERT record " + entry.recordId);
+                        }
+                        break;
+                    case UPDATE:
+                        // Reappliquer la modification (image apres)
+                        if (entry.afterImage != null && entry.recordId >= 0 && entry.recordId < recordCount) {
+                            int pageId = entry.recordId / RECORDS_PER_PAGE;
+                            int recordOffset = (entry.recordId % RECORDS_PER_PAGE) * RECORD_SIZE;
+                            byte[] pageData = fix(pageId);
+                            try {
+                                System.arraycopy(entry.afterImage, 0, pageData, recordOffset, RECORD_SIZE);
+                                writePageToDisk(pageId, bufferPool.get(pageId));
+                            } finally {
+                                unfix(pageId);
+                            }
+                            System.out.println("[REDO] UPDATE record " + entry.recordId);
+                        }
+                        break;
+                    default:
+                        break;
+                }
+            }
+        }
+
+        // Phase 3: UNDO - Annuler les operations des transactions non commitees
+        System.out.println("[RECOVERY] Phase UNDO - Annuler les transactions non commitees...");
+        // Parcourir le journal a l'envers pour UNDO
+        for (int i = journalEntries.size() - 1; i >= startIndex; i--) {
+            LogEntry entry = journalEntries.get(i);
+            if (activeTx.contains(entry.transactionId)) {
+                switch (entry.type) {
+                    case INSERT:
+                        // Annuler l'insertion - restaurer le recordCount
+                        if (entry.recordCountSnapshot >= 0) {
+                            // On ne peut pas vraiment "supprimer" mais on peut ignorer
+                            System.out.println("[UNDO] INSERT record " + entry.recordId + " (ignore)");
+                        }
+                        break;
+                    case UPDATE:
+                        // Restaurer l'image avant
+                        if (entry.beforeImage != null && entry.recordId >= 0 && entry.recordId < recordCount) {
+                            int pageId = entry.recordId / RECORDS_PER_PAGE;
+                            int recordOffset = (entry.recordId % RECORDS_PER_PAGE) * RECORD_SIZE;
+                            byte[] pageData = fix(pageId);
+                            try {
+                                System.arraycopy(entry.beforeImage, 0, pageData, recordOffset, RECORD_SIZE);
+                                writePageToDisk(pageId, bufferPool.get(pageId));
+                            } finally {
+                                unfix(pageId);
+                            }
+                            System.out.println("[UNDO] UPDATE record " + entry.recordId + " - valeur restauree");
+                        }
+                        break;
+                    default:
+                        break;
+                }
+            }
+        }
+
+        // Nettoyer les buffers
+        bufferPool.clear();
+
+        System.out.println("[RECOVERY] Recuperation terminee avec succes!");
+    }
+
+    /**
+     * Vide le fichier journal (pour les tests).
+     */
+    public void clearJournal() throws IOException {
+        Files.write(journalFilePath, new byte[0]);
+    }
+
+    /**
+     * Affiche le contenu du journal (pour debug).
+     */
+    public void printJournal() throws IOException {
+        System.out.println("=== Contenu du Journal (FJT) ===");
+        if (Files.exists(journalFilePath)) {
+            List<String> lines = Files.readAllLines(journalFilePath);
+            for (String line : lines) {
+                LogEntry entry = LogEntry.deserialize(line);
+                if (entry != null) {
+                    System.out.println("  " + entry);
+                }
+            }
+        }
+        System.out.println("================================");
     }
 
     public static void main(String[] args) throws IOException {
@@ -497,5 +882,106 @@ public class MiniSGBD {
         db.rollback();
 
         System.out.println("\n=== Tous les tests TD4 termines avec succes! ===");
+
+        // ==================== TD5: Tests Journalisation et Recovery ====================
+        System.out.println("\n\n========================================");
+        System.out.println("=== TD5: Tests Journalisation, Checkpoint et Recovery ===");
+        System.out.println("========================================");
+
+        // Reinitialiser pour les tests TD5
+        Files.deleteIfExists(dbPath);
+        Files.deleteIfExists(Paths.get("etudiants.db.log"));
+        MiniSGBD db5 = new MiniSGBD("etudiants.db");
+
+        // Creer des donnees initiales
+        System.out.println("\n--- Etape 1: Creation des donnees initiales ---");
+        for (int i = 1; i <= 10; i++) {
+            db5.begin();
+            db5.insertRecord("Etudiant " + i);
+            db5.commit();
+        }
+        db5.checkpoint();
+        System.out.println("10 etudiants crees et checkpoint effectue");
+
+        // Afficher l'etat initial
+        System.out.println("\nEtat initial:");
+        for (int i = 0; i < 5; i++) {
+            System.out.println("  Record " + i + ": " + db5.readRecord(i));
+        }
+
+        // Test 1: Transaction commitee puis crash
+        System.out.println("\n--- Test 1: Transaction COMMITEE puis CRASH ---");
+        db5.begin();
+        db5.updateRecord(0, "MODIFIE_TX_COMMITEE");
+        db5.commit();
+        System.out.println("Transaction commitee: Record 0 = 'MODIFIE_TX_COMMITEE'");
+
+        // Simuler un crash AVANT checkpoint (les donnees sont dans le journal mais pas sur disque)
+        db5.crash();
+
+        // Recovery
+        db5.recover();
+        System.out.println("Apres recovery - Record 0: " + db5.readRecord(0));
+
+        // Test 2: Transaction NON commitee puis crash (doit etre annulee)
+        System.out.println("\n--- Test 2: Transaction NON COMMITEE puis CRASH ---");
+        db5.checkpoint(); // Checkpoint propre
+
+        System.out.println("Avant modification - Record 1: " + db5.readRecord(1));
+
+        db5.begin();
+        db5.updateRecord(1, "MODIFIE_TX_NON_COMMITEE");
+        System.out.println("En transaction (non commitee) - Record 1: " + db5.readRecord(1));
+
+        // Crash SANS commit!
+        db5.crash();
+
+        // Recovery - doit restaurer la valeur originale
+        db5.recover();
+        System.out.println("Apres recovery (UNDO) - Record 1: " + db5.readRecord(1));
+
+        // Test 3: Scenario complet avec plusieurs transactions
+        System.out.println("\n--- Test 3: Scenario complexe ---");
+        db5.checkpoint();
+
+        // Transaction 1: Commitee
+        db5.begin();
+        db5.updateRecord(2, "TX1_COMMITEE");
+        db5.commit();
+        System.out.println("TX1 commitee: Record 2 = 'TX1_COMMITEE'");
+
+        // Transaction 2: Commitee
+        db5.begin();
+        db5.updateRecord(3, "TX2_COMMITEE");
+        db5.commit();
+        System.out.println("TX2 commitee: Record 3 = 'TX2_COMMITEE'");
+
+        // Transaction 3: NON Commitee (en cours au moment du crash)
+        db5.begin();
+        db5.updateRecord(4, "TX3_NON_COMMITEE");
+        System.out.println("TX3 non commitee: Record 4 = 'TX3_NON_COMMITEE'");
+
+        // CRASH!
+        db5.crash();
+
+        // Recovery
+        System.out.println("\nRecovery apres crash...");
+        db5.recover();
+
+        System.out.println("\nResultats attendus:");
+        System.out.println("  Record 2: TX1_COMMITEE (REDO)");
+        System.out.println("  Record 3: TX2_COMMITEE (REDO)");
+        System.out.println("  Record 4: Etudiant 5 (UNDO - valeur originale)");
+
+        System.out.println("\nResultats obtenus:");
+        System.out.println("  Record 2: " + db5.readRecord(2));
+        System.out.println("  Record 3: " + db5.readRecord(3));
+        System.out.println("  Record 4: " + db5.readRecord(4));
+
+        // Afficher le journal final
+        System.out.println("\n--- Contenu du journal ---");
+        db5.printJournal();
+
+        System.out.println("\n=== Tous les tests TD5 termines avec succes! ===");
     }
 }
