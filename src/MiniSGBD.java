@@ -1,15 +1,18 @@
-﻿import java.io.IOException; 
+import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 public class MiniSGBD {
     private static final int PAGE_SIZE = 4096;
@@ -29,7 +32,13 @@ public class MiniSGBD {
     }
 
     private final Path filePath;
+    // TIA (Tampon d'Images Après) - Buffer contenant les nouvelles valeurs
     private final Map<Integer, PageFrame> bufferPool = new HashMap<>();
+    // TIV (Tampon d'Images Avant) - Buffer contenant les anciennes valeurs avant modification
+    private final Map<Integer, byte[]> tiv = new HashMap<>();
+    // Table des verrous sur les enregistrements
+    private final Set<Integer> locks = new HashSet<>();
+
     private long recordCount;
     private boolean inTransaction;
     private long transactionStartRecordCount = -1;
@@ -62,6 +71,7 @@ public class MiniSGBD {
         if (!inTransaction) {
             return;
         }
+        // Forcer sur disque toutes les pages transactionnelles modifiees (FORCE)
         for (Map.Entry<Integer, PageFrame> entry : bufferPool.entrySet()) {
             int pageId = entry.getKey();
             PageFrame frame = entry.getValue();
@@ -71,6 +81,13 @@ public class MiniSGBD {
                 frame.transactional = false;
             }
         }
+
+        // Vider le TIV (les anciennes valeurs ne sont plus necessaires)
+        tiv.clear();
+
+        // Liberer tous les verrous poses par la transaction
+        locks.clear();
+
         inTransaction = false;
         transactionStartRecordCount = -1;
     }
@@ -82,6 +99,26 @@ public class MiniSGBD {
         recordCount = transactionStartRecordCount;
         transactionStartRecordCount = -1;
 
+        // Restaurer les anciennes valeurs depuis le TIV vers le TIA
+        for (Map.Entry<Integer, byte[]> entry : tiv.entrySet()) {
+            int pageId = entry.getKey();
+            byte[] oldData = entry.getValue();
+            PageFrame frame = bufferPool.get(pageId);
+            if (frame != null) {
+                // Restaurer les données originales
+                System.arraycopy(oldData, 0, frame.data, 0, oldData.length);
+                frame.dirty = false;
+                frame.transactional = false;
+            }
+        }
+
+        // Vider le TIV
+        tiv.clear();
+
+        // Liberer tous les verrous
+        locks.clear();
+
+        // Supprimer les pages purement transactionnelles (nouvelles pages sans TIV)
         Iterator<Map.Entry<Integer, PageFrame>> iterator = bufferPool.entrySet().iterator();
         while (iterator.hasNext()) {
             Map.Entry<Integer, PageFrame> entry = iterator.next();
@@ -220,6 +257,76 @@ public class MiniSGBD {
         insertRecordInternal(data, true);
     }
 
+    /**
+     * Met a jour un enregistrement existant.
+     * En transaction: verrouille l'enregistrement et sauvegarde l'ancienne valeur dans le TIV.
+     * @param recordId l'identifiant de l'enregistrement a modifier
+     * @param newData les nouvelles donnees
+     * @throws IOException en cas d'erreur d'E/S
+     * @throws IllegalStateException si l'enregistrement est deja verrouille
+     */
+    public synchronized void updateRecord(int recordId, String newData) throws IOException {
+        if (recordId < 0 || recordId >= recordCount) {
+            throw new IllegalArgumentException("Record id " + recordId + " is out of bounds");
+        }
+        if (newData == null) {
+            throw new IllegalArgumentException("Record data cannot be null");
+        }
+
+        byte[] payload = newData.getBytes(StandardCharsets.UTF_8);
+        if (payload.length > RECORD_SIZE) {
+            throw new IllegalArgumentException("Record data exceeds fixed size of " + RECORD_SIZE + " bytes");
+        }
+
+        // Verifier si l'enregistrement est deja verrouille
+        if (locks.contains(recordId)) {
+            throw new IllegalStateException("Record " + recordId + " is already locked by another transaction");
+        }
+
+        int pageId = recordId / RECORDS_PER_PAGE;
+        int recordOffset = (recordId % RECORDS_PER_PAGE) * RECORD_SIZE;
+
+        byte[] pageData = fix(pageId);
+        try {
+            // Si en transaction, sauvegarder l'image avant dans le TIV
+            if (inTransaction) {
+                // Sauvegarder la page entiere dans le TIV si pas deja fait
+                if (!tiv.containsKey(pageId)) {
+                    byte[] beforeImage = Arrays.copyOf(pageData, pageData.length);
+                    tiv.put(pageId, beforeImage);
+                }
+                // Poser un verrou sur l'enregistrement
+                locks.add(recordId);
+            }
+
+            // Preparer le nouvel enregistrement (padding avec des zeros)
+            byte[] record = new byte[RECORD_SIZE];
+            System.arraycopy(payload, 0, record, 0, payload.length);
+
+            // Modifier la donnee dans le TIA uniquement
+            System.arraycopy(record, 0, pageData, recordOffset, RECORD_SIZE);
+            use(pageId);
+        } finally {
+            unfix(pageId);
+        }
+    }
+
+    /**
+     * Verifie si un enregistrement est verrouille.
+     * @param recordId l'identifiant de l'enregistrement
+     * @return true si l'enregistrement est verrouille
+     */
+    public synchronized boolean isLocked(int recordId) {
+        return locks.contains(recordId);
+    }
+
+    /**
+     * Lit un enregistrement.
+     * Politique de lecture:
+     * - Pas de transaction: lecture depuis TIA
+     * - Transaction en cours + pas de verrou: lecture depuis TIA
+     * - Transaction en cours + enregistrement verrouille: lecture depuis TIV (ancienne valeur)
+     */
     public synchronized String readRecord(int recordId) throws IOException {
         if (recordId < 0 || recordId >= recordCount) {
             throw new IllegalArgumentException("Record id " + recordId + " is out of bounds");
@@ -227,6 +334,16 @@ public class MiniSGBD {
 
         int pageId = recordId / RECORDS_PER_PAGE;
         int recordOffset = (recordId % RECORDS_PER_PAGE) * RECORD_SIZE;
+
+        // Si en transaction et l'enregistrement est verrouille, lire depuis le TIV
+        if (inTransaction && locks.contains(recordId)) {
+            byte[] tivData = tiv.get(pageId);
+            if (tivData != null) {
+                return decodeRecord(tivData, recordOffset);
+            }
+        }
+
+        // Sinon, lire depuis le TIA (buffer normal)
         byte[] pageData = fix(pageId);
         try {
             return decodeRecord(pageData, recordOffset);
@@ -278,6 +395,7 @@ public class MiniSGBD {
 
         MiniSGBD db = new MiniSGBD("etudiants.db");
 
+        System.out.println("=== TD1-TD3: Tests de base ===");
         for (int i = 1; i <= 105; i++) {
             if (i % 10 == 0) {
                 db.insertRecordSync("Etudiant " + i);
@@ -296,22 +414,88 @@ public class MiniSGBD {
         System.out.println("Page 2 : " + db.getPage(1));
         System.out.println("Page 3 : " + db.getPage(2));
 
-        // 🔹 Démonstration rollback
+        // Demonstration rollback insertion
         db.begin();
         db.insertRecord("Etudiant 200");
         db.insertRecord("Etudiant 201");
         db.rollback();
-        System.out.println("Count après rollback (attendu 105) : " + db.getRecordCount());
+        System.out.println("Count apres rollback (attendu 105) : " + db.getRecordCount());
 
-        // 🔹 Démonstration commit
+        // Demonstration commit insertion
         db.begin();
         db.insertRecord("Etudiant 202");
         db.insertRecord("Etudiant 203");
         db.commit();
-        System.out.println("Count après commit (attendu 107) : " + db.getRecordCount());
+        System.out.println("Count apres commit (attendu 107) : " + db.getRecordCount());
 
-        // Vérification que les enregistrements sont bien présents
         System.out.println("Enregistrement 106 : " + db.readRecord(105));
         System.out.println("Enregistrement 107 : " + db.readRecord(106));
+
+        System.out.println("\n=== TD4: Tests TIV, TIA et Verrouillage ===");
+
+        // Test 1: UPDATE avec ROLLBACK - restauration depuis TIV
+        System.out.println("\n--- Test 1: UPDATE avec ROLLBACK ---");
+        System.out.println("Avant modification - Enregistrement 0 : " + db.readRecord(0));
+
+        db.begin();
+        db.updateRecord(0, "Etudiant MODIFIE");
+        System.out.println("Apres UPDATE (en transaction) - Enregistrement 0 : " + db.readRecord(0));
+        System.out.println("Enregistrement 0 verrouille ? " + db.isLocked(0));
+
+        db.rollback();
+        System.out.println("Apres ROLLBACK - Enregistrement 0 : " + db.readRecord(0));
+        System.out.println("Enregistrement 0 verrouille ? " + db.isLocked(0));
+
+        // Test 2: UPDATE avec COMMIT - persistence des modifications
+        System.out.println("\n--- Test 2: UPDATE avec COMMIT ---");
+        System.out.println("Avant modification - Enregistrement 1 : " + db.readRecord(1));
+
+        db.begin();
+        db.updateRecord(1, "Etudiant 2 MODIFIE PERMANENT");
+        System.out.println("Apres UPDATE (en transaction) - Enregistrement 1 : " + db.readRecord(1));
+
+        db.commit();
+        System.out.println("Apres COMMIT - Enregistrement 1 : " + db.readRecord(1));
+
+        // Test 3: Lecture coherente avec TIV
+        System.out.println("\n--- Test 3: Lecture coherente (TIV) ---");
+        System.out.println("Valeur initiale - Enregistrement 2 : " + db.readRecord(2));
+
+        db.begin();
+        db.updateRecord(2, "NOUVELLE VALEUR");
+        // En transaction avec verrou, readRecord retourne l'ancienne valeur (TIV)
+        System.out.println("Lecture pendant transaction (depuis TIV) : " + db.readRecord(2));
+        db.commit();
+        System.out.println("Apres COMMIT (nouvelle valeur) : " + db.readRecord(2));
+
+        // Test 4: Multiple updates dans une transaction
+        System.out.println("\n--- Test 4: Updates multiples + ROLLBACK ---");
+        System.out.println("Avant - Enregistrement 10 : " + db.readRecord(10));
+        System.out.println("Avant - Enregistrement 11 : " + db.readRecord(11));
+
+        db.begin();
+        db.updateRecord(10, "Record 10 MODIFIE");
+        db.updateRecord(11, "Record 11 MODIFIE");
+        System.out.println("Pendant transaction - Enregistrement 10 : " + db.readRecord(10));
+        System.out.println("Pendant transaction - Enregistrement 11 : " + db.readRecord(11));
+
+        db.rollback();
+        System.out.println("Apres ROLLBACK - Enregistrement 10 : " + db.readRecord(10));
+        System.out.println("Apres ROLLBACK - Enregistrement 11 : " + db.readRecord(11));
+
+        // Test 5: Verification du verrouillage (tentative de double lock)
+        System.out.println("\n--- Test 5: Detection de verrouillage ---");
+        db.begin();
+        db.updateRecord(20, "Premier UPDATE");
+        System.out.println("Enregistrement 20 verrouille : " + db.isLocked(20));
+        try {
+            db.updateRecord(20, "Deuxieme UPDATE - devrait echouer");
+            System.out.println("ERREUR: Le double verrouillage aurait du echouer!");
+        } catch (IllegalStateException e) {
+            System.out.println("OK: Double verrouillage detecte - " + e.getMessage());
+        }
+        db.rollback();
+
+        System.out.println("\n=== Tous les tests TD4 termines avec succes! ===");
     }
 }
