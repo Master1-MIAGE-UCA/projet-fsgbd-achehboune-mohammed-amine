@@ -330,37 +330,17 @@ javac MiniSGBD.java
 java MiniSGBD
 ```
 
-### Sortie attendue
-```
-=== TD1-TD3: Tests de base ===
-Enregistrement 42 : Etudiant 42
-Page 1 : [Etudiant 1, Etudiant 2, ...]
-...
 
-=== TD4: Tests TIV, TIA et Verrouillage ===
---- Test 1: UPDATE avec ROLLBACK ---
-...
-
-=== TD5: Tests Journalisation, Checkpoint et Recovery ===
-[CHECKPOINT] Point de sauvegarde cree
-[CRASH] Simulation de panne systeme...
-[RECOVERY] Demarrage de la recuperation...
-[REDO] UPDATE record 0
-...
-=== Tous les tests TD5 termines avec succes! ===
-```
-
----
 
 ## Resume des Concepts SGBD
 
 | Etape | Concept | Implementation |
 |-------|---------|----------------|
-| TD1 | Stockage par pages | `PAGE_SIZE`, `RECORD_SIZE`, pages de 40 enregistrements |
-| TD2 | Buffer management | `FIX`, `UNFIX`, `USE`, `FORCE`, `PageFrame` |
-| TD3 | Transactions | `BEGIN`, `COMMIT`, `ROLLBACK`, flag `transactional` |
-| TD4 | Images avant/apres | `TIV`, `TIA`, `locks`, `updateRecord` |
-| TD5 | Journalisation | `LogEntry`, `checkpoint`, `crash`, `recover` |
+| 1 | Stockage par pages | `PAGE_SIZE`, `RECORD_SIZE`, pages de 40 enregistrements |
+| 2 | Buffer management | `FIX`, `UNFIX`, `USE`, `FORCE`, `PageFrame` |
+| 3 | Transactions | `BEGIN`, `COMMIT`, `ROLLBACK`, flag `transactional` |
+| 4 | Images avant/apres | `TIV`, `TIA`, `locks`, `updateRecord` |
+| 5 | Journalisation | `LogEntry`, `checkpoint`, `crash`, `recover` |
 
 ---
 
@@ -375,4 +355,4 @@ Page 1 : [Etudiant 1, Etudiant 2, ...]
 
 ## Auteur
 
-Projet realise dans le cadre du cours de Gestion de Fichiers et Structures de Donnees (FSGBD).
+Projet realise dans le cadre du cours de Gestion de Fichiers et Structures de Donnees (FSGBD) par ACHEHBOUNE Mohammed-Amine
